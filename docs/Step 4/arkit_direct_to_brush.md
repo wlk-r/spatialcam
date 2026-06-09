@@ -109,6 +109,16 @@ Caveat in the comparison: the Metashape run was 30k steps (`brush_30k`) vs our 2
 
 ## 6. Required change: raise the seed-cloud cap (500k → larger)
 
+> **Update (2026-06-09): implemented.** The app now uses 1.5 cm voxels with a 3M cap and
+> samples real colors from the captured image (seeds were flat gray before), and the
+> converter grew `--fuse-depth` (conf==2-only LiDAR fusion with JPEG colors). Also fixed:
+> the capture app's seed unprojection was missing the Y negation (image v-down vs camera
+> Y-up), so **seed clouds from sessions before this date are vertically mirrored per
+> camera — rebuild them with `--fuse-depth` rather than trusting `seed_points.ply`**.
+> That bug means the 500k-seed numbers in §4's head-to-head undersell the direct path;
+> rerun the comparison with a fresh capture. `seed_points.ply` is now binary, not ascii.
+> Original analysis kept below.
+
 **The 500k `seed_point_count` is itself an init-density limiter.** The comparison shows Brush's early completeness tracks the seed count almost linearly, and Metashape's advantage at 5k was simply 1.31M seed points vs our 500k. To compete on near-field density without Metashape:
 
 - **Raise `seed_point_count` in the capture/export step to ~1.5–3M** (Metashape's ~1.3M is a sensible floor; the LiDAR mesh easily supports more within range).

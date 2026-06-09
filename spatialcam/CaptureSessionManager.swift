@@ -480,8 +480,11 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
                 if let confRow, confRow[x] == 0 { continue }
                 let z = depthRow[x]
                 guard z.isFinite, z > 0.05, z < 20 else { continue }
+                // Image v points down while ARKit camera +Y points up, so the pinhole
+                // lift is (x', -y', -z) — Apple's scene-depth sample applies the same
+                // flipYZ. Omitting the Y negation mirrors seeds about each optical axis.
                 let camX = (Float(x) - cx) / fx * z
-                let camY = (Float(y) - cy) / fy * z
+                let camY = -(Float(y) - cy) / fy * z
                 let local = simd_float4(camX, camY, -z, 1)
                 let world = transform * local
 
@@ -554,8 +557,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         guard let destination = CGImageDestinationCreateWithURL(imageURL as CFURL, imageUTType.identifier as CFString, 1, nil) else {
             rollback(); return false
         }
-        let options = [kCGImageDestinationLossyCompressionQuality: imageCompressionQuality] as CFDictionary
-        CGImageDestinationAddImage(destination, cgImage, options)
+        CGImageDestinationAddImage(destination, cgImage, imageProperties(for: sidecar))
         guard CGImageDestinationFinalize(destination) else {
             rollback(); return false
         }
@@ -576,6 +578,46 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
 
         return true
     }
+
+    // EXIF/TIFF for the Metashape path: it auto-builds calibration groups from
+    // (Make, Model, 35mm focal, resolution), so embedding these lets it initialize
+    // sensible groups without manual calibration import. The 35mm focal is rounded
+    // to an integer so autofocus drift doesn't shatter shots into per-image groups.
+    private func imageProperties(for sidecar: ShotSidecar) -> CFDictionary {
+        var exif: [CFString: Any] = [
+            kCGImagePropertyExifExposureTime: sidecar.exposureDuration,
+            kCGImagePropertyExifLensModel: sidecar.lens,
+            kCGImagePropertyExifDateTimeOriginal: Self.exifDateFormatter.string(from: Date())
+        ]
+        let fx = sidecar.intrinsics[0][0]
+        let w = Float(sidecar.resolution[0])
+        let h = Float(sidecar.resolution[1])
+        let diagonal = (w * w + h * h).squareRoot()
+        if diagonal > 0, fx.isFinite {
+            exif[kCGImagePropertyExifFocalLenIn35mmFilm] = Int((fx * 43.266615 / diagonal).rounded())
+        }
+        if let iso = sidecar.iso {
+            exif[kCGImagePropertyExifISOSpeedRatings] = [Int(iso.rounded())]
+        }
+
+        var tiff: [CFString: Any] = [kCGImagePropertyTIFFMake: "Apple"]
+        if let model = manifestContext?.deviceModel {
+            tiff[kCGImagePropertyTIFFModel] = model
+        }
+
+        return [
+            kCGImagePropertyExifDictionary: exif,
+            kCGImagePropertyTIFFDictionary: tiff,
+            kCGImageDestinationLossyCompressionQuality: imageCompressionQuality
+        ] as CFDictionary
+    }
+
+    private static let exifDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+        return formatter
+    }()
 
     private func writeSeedCloud() {
         guard let dir = sessionDir, seedCloud.count > 0 else { return }

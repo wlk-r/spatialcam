@@ -21,9 +21,22 @@ Coordinate conversion (the manifest's "step 4"):
 
 Usage:
   python3 arkit_to_colmap.py SESSION_DIR OUT_DIR [--voxel 0.0] [--copy]
+                             [--fuse-depth] [--fuse-stride 2] [--fuse-voxel 0.015]
+                             [--fuse-max-depth 8.0]
 
-  --voxel METERS  voxel-downsample the seed cloud (0 = keep all points; default 0)
-  --copy          copy JPEGs instead of symlinking them into out/images/
+  --voxel METERS     voxel-downsample the final cloud (0 = keep all points; default 0)
+  --copy             copy JPEGs instead of symlinking them into out/images/
+  --fuse-depth       unproject per-shot LiDAR depth (confidence == 2 only) to world,
+                     sample colors from the JPEGs, voxel-merge with the seed cloud.
+                     Densifies near-field init the way Metashape's seed does
+                     (arkit_direct_to_brush.md §6). Decodes every JPEG once for
+                     colors, so expect ~1-2 min on a long session (needs Pillow;
+                     falls back to gray without it).
+  --fuse-stride N    sample every Nth depth pixel in x and y (default 2)
+  --fuse-voxel M     voxel size for merging fused+seed points (default 0.015,
+                     matching the app's seed voxel)
+  --fuse-max-depth M discard depth samples beyond M meters (default 8.0; LiDAR
+                     noise grows past ~5 m)
 """
 
 import argparse
@@ -131,8 +144,13 @@ def read_ply_xyzrgb(path):
 
 def voxel_downsample(xyz, rgb, voxel):
     """Average points (and colors) within each voxel cell."""
-    keys = np.floor(xyz / voxel).astype(np.int64)
-    _, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    keys3 = np.floor(xyz / voxel).astype(np.int64)
+    if np.abs(keys3).max() >= 2 ** 20:
+        raise ValueError(f"scene too large for {voxel} m voxel packing (> ±15 km)")
+    # Pack the 3 voxel indices into one int64: unique() on a flat array lexsorts
+    # ~10x faster than axis=0 on the multi-million-point fused clouds.
+    keys = ((keys3[:, 0] + 2 ** 20) << 42) | ((keys3[:, 1] + 2 ** 20) << 21) | (keys3[:, 2] + 2 ** 20)
+    _, inv, counts = np.unique(keys, return_inverse=True, return_counts=True)
     nv = counts.shape[0]
     sums = np.zeros((nv, 3))
     csum = np.zeros((nv, 3))
@@ -141,14 +159,91 @@ def voxel_downsample(xyz, rgb, voxel):
     return sums / counts[:, None], np.rint(csum / counts[:, None]).astype(np.uint8)
 
 
+# ---------------------------------------------------------------- depth fusion
+def fuse_depth_points(session, shots, stride, max_depth):
+    """Unproject confidence==2 LiDAR depth pixels to world coords with JPEG colors.
+
+    `shots` are the parsed sidecar dicts that passed the tracking filter.
+    Returns (N,3) float64 xyz and (N,3) uint8 rgb (unmerged; caller voxel-merges).
+    """
+    try:
+        from PIL import Image
+        have_pil = True
+    except ImportError:
+        have_pil = False
+        print("note: Pillow not installed; fused points get neutral gray colors",
+              file=sys.stderr)
+
+    all_xyz, all_rgb = [], []
+    used = 0
+    for d in shots:
+        rec = d.get("depth")
+        if not rec:
+            continue
+        dpath = session / rec["file"]
+        if not dpath.exists():
+            continue
+        dw, dh = rec["resolution"]
+        z = np.fromfile(dpath, dtype="<f4").reshape(dh, dw)
+
+        conf_name = rec.get("confidence")
+        if conf_name and (session / conf_name).exists():
+            conf = np.fromfile(session / conf_name, dtype=np.uint8).reshape(dh, dw)
+            mask = conf == 2          # high confidence only: edges/long range seed fuzz
+        else:
+            mask = np.ones((dh, dw), bool)
+        strided = np.zeros((dh, dw), bool)
+        strided[::stride, ::stride] = True
+        mask &= strided & np.isfinite(z) & (z > 0.05) & (z < max_depth)
+        if not mask.any():
+            continue
+
+        vs, us = np.nonzero(mask)
+        zs = z[vs, us].astype(np.float64)
+        K = d["intrinsics"]
+        w, h = d["resolution"]
+        fx, fy = K[0][0] * dw / w, K[1][1] * dh / h
+        cx, cy = K[0][2] * dw / w, K[1][2] * dh / h
+        # ARKit camera: +X right, +Y up, -Z forward; image v points down => the
+        # pinhole lift is (x', -y', -z), same flipYZ as Apple's scene-depth sample.
+        xc = (us - cx) / fx * zs
+        yc = -(vs - cy) / fy * zs
+        cam = np.stack([xc, yc, -zs, np.ones_like(zs)], axis=1)
+        T = np.asarray(d["transform_camera_to_world"], dtype=np.float64)
+        all_xyz.append((T @ cam.T).T[:, :3])
+
+        if have_pil:
+            img = np.asarray(Image.open(session / d["image"]).convert("RGB"))
+            ih, iw = img.shape[:2]
+            px = np.clip(((us + 0.5) * iw / dw).astype(int), 0, iw - 1)
+            py = np.clip(((vs + 0.5) * ih / dh).astype(int), 0, ih - 1)
+            all_rgb.append(img[py, px])
+        else:
+            all_rgb.append(np.full((len(zs), 3), 180, np.uint8))
+        used += 1
+
+    if not all_xyz:
+        return np.zeros((0, 3)), np.zeros((0, 3), np.uint8)
+    print(f"depth fusion   : {used} shots unprojected (conf==2, stride {stride}, <{max_depth} m)")
+    return np.concatenate(all_xyz), np.concatenate(all_rgb)
+
+
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("session", type=Path)
     ap.add_argument("out", type=Path)
     ap.add_argument("--voxel", type=float, default=0.0,
-                    help="voxel size in meters for seed-cloud downsample (0 = keep all)")
+                    help="voxel size in meters for final-cloud downsample (0 = keep all)")
     ap.add_argument("--copy", action="store_true", help="copy images instead of symlinking")
+    ap.add_argument("--fuse-depth", action="store_true",
+                    help="fuse per-shot LiDAR depth (confidence==2) into the seed cloud")
+    ap.add_argument("--fuse-stride", type=int, default=2,
+                    help="sample every Nth depth pixel when fusing (default 2)")
+    ap.add_argument("--fuse-voxel", type=float, default=0.015,
+                    help="voxel size for merging fused+seed points (default 0.015)")
+    ap.add_argument("--fuse-max-depth", type=float, default=8.0,
+                    help="discard depth samples beyond this range in meters (default 8)")
     args = ap.parse_args()
 
     session, out = args.session, args.out
@@ -162,12 +257,14 @@ def main():
         sys.exit(f"no shot_*.json found in {session}")
 
     cam_lines, img_lines = [], []
+    accepted = []
     skipped = 0
     for cam_id, jp in enumerate(shots, start=1):
         d = json.loads(jp.read_text())
         if d.get("tracking_state") not in (None, "normal"):
             skipped += 1
             continue
+        accepted.append(d)
         K = d["intrinsics"]
         fx, fy, cx, cy = K[0][0], K[1][1], K[0][2], K[1][2]
         w, h = d["resolution"]
@@ -205,12 +302,25 @@ def main():
         f.write(f"# Number of images: {len(cam_lines)}\n")
         f.write("\n".join(img_lines) + "\n")
 
-    # points3D.txt from seed cloud
+    # points3D.txt from seed cloud (+ optional LiDAR depth fusion)
     ply = session / "seed_points.ply"
-    xyz, rgb = read_ply_xyzrgb(ply)
+    if ply.exists():
+        xyz, rgb = read_ply_xyzrgb(ply)
+    else:
+        print(f"warning: no seed_points.ply in {session}", file=sys.stderr)
+        xyz, rgb = np.zeros((0, 3)), np.zeros((0, 3), np.uint8)
     n_raw = len(xyz)
-    if args.voxel > 0:
-        xyz, rgb = voxel_downsample(xyz, rgb, args.voxel)
+
+    if args.fuse_depth:
+        fxyz, frgb = fuse_depth_points(session, accepted, args.fuse_stride, args.fuse_max_depth)
+        xyz = np.concatenate([xyz, fxyz])
+        rgb = np.concatenate([rgb, frgb])
+
+    # --voxel governs when set; otherwise fusion still needs a merge pass to
+    # dedupe fused points against the seed cloud (and against themselves).
+    merge_voxel = args.voxel if args.voxel > 0 else (args.fuse_voxel if args.fuse_depth else 0.0)
+    if merge_voxel > 0 and len(xyz):
+        xyz, rgb = voxel_downsample(xyz, rgb, merge_voxel)
     ext = xyz.max(0) - xyz.min(0)
     with open(sparse / "points3D.txt", "w") as f:
         f.write("# 3D point list\n# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]\n")
@@ -223,7 +333,8 @@ def main():
 
     print(f"cameras/images : {len(cam_lines)} written ({skipped} skipped: bad tracking)")
     print(f"points3D       : {len(xyz)} written"
-          + (f" (voxel {args.voxel} m, from {n_raw})" if args.voxel > 0 else f" (all {n_raw})"))
+          + (f" (merged at {merge_voxel} m; seed cloud contributed {n_raw})"
+             if merge_voxel > 0 else f" (all {n_raw} seed points)"))
     print(f"scene extent   : {ext[0]:.2f} x {ext[1]:.2f} x {ext[2]:.2f} m")
     print(f"output         : {out}")
     print(f"train          : brush {out}")

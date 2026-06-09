@@ -9,6 +9,16 @@ A session is one directory: `session_<ISO8601>/` containing `manifest.json`, a p
 `seed_points.ply`, and per shot `shot_NNNN.jpg` + `shot_NNNN.json` (NNNN zero-padded,
 1-indexed, contiguous). LiDAR devices may also write per-shot raw depth and confidence files.
 
+`seed_points.ply` is **binary_little_endian** since the v2 writer (was ascii in v1); fields
+are unchanged (float x/y/z + uchar red/green/blue). Readers should handle both — the
+exporter's `read_ply_xyzrgb` does. JPEGs carry EXIF/TIFF (Make/Model, rounded 35mm-equiv
+focal, exposure, ISO) so Metashape can auto-build calibration groups.
+
+> **v1 seed clouds are unreliable:** the v1 writer had a sign bug in depth unprojection
+> (missing Y negation), mirroring seed points vertically about each camera's optical axis.
+> For v1 sessions, rebuild the seed cloud from the raw depth files instead via
+> `arkit_to_colmap.py --fuse-depth` (the camera poses, images, and depth files are fine).
+
 ## Conventions (the part that must not drift)
 
 - **All matrices are row-major** in JSON. A 4×4 is `[[r0c0..r0c3], …]`.
