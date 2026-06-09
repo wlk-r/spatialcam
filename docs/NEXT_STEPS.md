@@ -112,7 +112,14 @@ iPhone 13 Pro class) before external distribution.
 
 ## Verified Locally
 
-Latest local validation:
+2026-06-09 — clean-device test PASSED on iPhone 13 Pro (iPhone14,2, iOS 26.5), the
+device class that previously stalled: delete-app-first install, always-on lifecycle,
+Stop -> New Capture -> Start cycle, two sessions (116 + 36 shots), zero stalls.
+Output validated: contiguous indices, sidecar v2 fields populated, binary colored
+seed cloud, EXIF (Make/Model/35mm/exposure/ISO) present, sessions share one world
+frame as designed.
+
+Earlier build-time validation:
 
 ```bash
 plutil -lint spatialcam/Info.plist spatialcam/PrivacyInfo.xcprivacy
