@@ -5,6 +5,8 @@ import RealityKit
 struct ContentView: View {
     @StateObject private var manager = CaptureSessionManager()
     @State private var pendingStorageWarning: String?
+    @State private var shareItem: ShareItem?
+    @State private var shareErrorMessage: String?
 
     var body: some View {
         ZStack {
@@ -28,6 +30,25 @@ struct ContentView: View {
             }
         } message: {
             Text(pendingStorageWarning ?? "")
+        }
+        .alert("Can't Create Zip", isPresented: shareErrorBinding) {
+            Button("Open Files") {
+                shareErrorMessage = nil
+                if let url = CaptureSessionManager.capturesFolderFilesURL() {
+                    UIApplication.shared.open(url)
+                }
+            }
+            Button("OK", role: .cancel) {
+                shareErrorMessage = nil
+            }
+        } message: {
+            Text(shareErrorMessage ?? "")
+        }
+        .sheet(item: $shareItem) { item in
+            ShareSheet(items: [item.url]) {
+                try? FileManager.default.removeItem(at: item.url)
+                shareItem = nil
+            }
         }
     }
 
@@ -66,6 +87,24 @@ struct ContentView: View {
                 }
 
                 Spacer()
+
+                if manager.hasCompletedSession, manager.completedSessionURL != nil {
+                    Button {
+                        shareCompletedSession()
+                    } label: {
+                        Group {
+                            if manager.isPreparingShare {
+                                ProgressView()
+                            } else {
+                                Image(systemName: "square.and.arrow.up")
+                                    .font(.headline)
+                            }
+                        }
+                        .frame(width: 44, height: 44)
+                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+                    }
+                    .disabled(manager.isPreparingShare)
+                }
 
                 Button {
                     handleCaptureButton()
@@ -141,6 +180,24 @@ struct ContentView: View {
         )
     }
 
+    private var shareErrorBinding: Binding<Bool> {
+        Binding(
+            get: { shareErrorMessage != nil },
+            set: { if !$0 { shareErrorMessage = nil } }
+        )
+    }
+
+    private func shareCompletedSession() {
+        manager.prepareShareArchive { result in
+            switch result {
+            case .success(let url):
+                shareItem = ShareItem(url: url)
+            case .failure(let error):
+                shareErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
     private var buttonColor: Color {
         if manager.isRecording {
             return .red
@@ -201,6 +258,24 @@ struct ContentView: View {
         }
         return "Ready"
     }
+}
+
+struct ShareItem: Identifiable {
+    let url: URL
+    var id: String { url.path }
+}
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+    let onComplete: () -> Void
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let controller = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, _, _, _ in onComplete() }
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 struct ARViewContainer: UIViewRepresentable {

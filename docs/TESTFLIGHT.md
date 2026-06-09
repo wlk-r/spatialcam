@@ -23,11 +23,12 @@ What to test:
 2. Tap Start.
 3. Slowly scan a room or connected spaces. The screen stays awake while recording.
 4. Tap Stop and wait until the app reports all files written.
-5. Send the capture back:
-   - Open the Files app > On My iPhone > 3Dgs Capture > captures.
-   - Long-press the session folder > Compress.
-   - Share the resulting .zip (AirDrop, iCloud link, or Mail). Sessions can be
-     several GB, so AirDrop or an iCloud/Drive link is usually best.
+5. Send the capture back: tap the share button next to Start, wait for the zip
+   to prepare, then AirDrop it or send an iCloud/Drive link. Sessions can be
+   several GB, so AirDrop or a cloud link is usually best.
+   - Fallback (e.g. if the phone is low on space): open the Files app >
+     On My iPhone > 3Dgs Capture > captures, long-press the session folder >
+     Compress, and share the resulting .zip.
 
 The app captures camera images, ARKit camera poses, camera intrinsics, LiDAR depth/confidence data when available, exposure metadata, and a local manifest. Captures are stored locally on device. The app does not upload data, use accounts, or track users.
 ```

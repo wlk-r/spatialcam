@@ -18,6 +18,8 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     @Published private(set) var pendingWriteCount = 0
     @Published private(set) var isFinalizing = false
     @Published private(set) var hasCompletedSession = false
+    @Published private(set) var completedSessionURL: URL?
+    @Published private(set) var isPreparingShare = false
 
     private let translationThreshold: Float = 0.12
     private let rotationThreshold: Float = .pi / 30
@@ -144,11 +146,90 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
             self.isAcceptingShots = false
             self.writeSeedCloud()
             self.writeManifest()
+            let dir = self.sessionDir
             DispatchQueue.main.async {
                 self.isFinalizing = false
                 self.hasCompletedSession = true
+                self.completedSessionURL = dir
             }
         }
+    }
+
+    // MARK: - Share
+
+    enum ShareArchiveError: LocalizedError {
+        case insufficientSpace(needed: Int64, available: Int64)
+        case archiveFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .insufficientSpace(let needed, let available):
+                return "Not enough free space to create a zip (needs about \(CaptureSessionManager.formatBytes(needed)), \(CaptureSessionManager.formatBytes(available)) available). Share the session folder directly from the Files app instead: On My iPhone > 3Dgs Capture > captures."
+            case .archiveFailed:
+                return "Could not create the zip archive. Share the session folder directly from the Files app instead: On My iPhone > 3Dgs Capture > captures."
+            }
+        }
+    }
+
+    func prepareShareArchive(completion: @escaping (Result<URL, Error>) -> Void) {
+        guard let sessionURL = completedSessionURL, !isPreparingShare else { return }
+        isPreparingShare = true
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            let finish: (Result<URL, Error>) -> Void = { result in
+                DispatchQueue.main.async {
+                    self.isPreparingShare = false
+                    completion(result)
+                }
+            }
+
+            // The zip is roughly session-sized (JPEGs don't recompress); demand that
+            // plus headroom before writing multi-GB into the temp directory.
+            let sessionSize = Self.directorySize(of: sessionURL)
+            if let available = self.availableDiskBytes(), available < sessionSize + 200 * 1024 * 1024 {
+                finish(.failure(ShareArchiveError.insufficientSpace(needed: sessionSize, available: available)))
+                return
+            }
+
+            // .forUploading hands back a zipped copy of the directory — the system's
+            // own folder-zipping path, no archive library needed. The zip only lives
+            // for the block, so copy it out to temp before returning.
+            var coordinatorError: NSError?
+            var result: Result<URL, Error> = .failure(ShareArchiveError.archiveFailed)
+            NSFileCoordinator().coordinate(readingItemAt: sessionURL, options: [.forUploading], error: &coordinatorError) { zipped in
+                do {
+                    let destination = FileManager.default.temporaryDirectory
+                        .appendingPathComponent(sessionURL.lastPathComponent)
+                        .appendingPathExtension("zip")
+                    try? FileManager.default.removeItem(at: destination)
+                    try FileManager.default.copyItem(at: zipped, to: destination)
+                    result = .success(destination)
+                } catch {
+                    result = .failure(error)
+                }
+            }
+            if let coordinatorError {
+                result = .failure(coordinatorError)
+            }
+            finish(result)
+        }
+    }
+
+    static func capturesFolderFilesURL() -> URL? {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let path = docs.appendingPathComponent("captures").path
+        return URL(string: "shareddocuments://" + path)
+    }
+
+    private static func directorySize(of url: URL) -> Int64 {
+        guard let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else {
+            return 0
+        }
+        var total: Int64 = 0
+        for case let fileURL as URL in enumerator {
+            total += Int64((try? fileURL.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+        }
+        return total
     }
 
     private func detectCapabilities() {
@@ -667,6 +748,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         seedPointCount = 0
         pendingWriteCount = 0
         hasCompletedSession = false
+        completedSessionURL = nil
         lastCaptureTransform = nil
         isCapturing = false
         isSessionPrepared = true
