@@ -7,6 +7,8 @@ struct SeedPoint {
 }
 
 final class SeedPointCloud {
+    static let defaultColor = SIMD3<UInt8>(180, 180, 180)
+
     private let voxelSize: Float
     private let maxPoints: Int
     private var voxels: [VoxelKey: SeedPoint] = [:]
@@ -22,7 +24,7 @@ final class SeedPointCloud {
         voxels.removeAll(keepingCapacity: true)
     }
 
-    func insert(_ point: simd_float3, color: SIMD3<UInt8> = SIMD3<UInt8>(180, 180, 180)) {
+    func insert(_ point: simd_float3, color: SIMD3<UInt8> = SeedPointCloud.defaultColor) {
         guard voxels.count < maxPoints else { return }
         guard point.x.isFinite, point.y.isFinite, point.z.isFinite else { return }
         let key = VoxelKey(point: point, voxelSize: voxelSize)

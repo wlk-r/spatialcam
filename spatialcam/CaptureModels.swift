@@ -39,6 +39,11 @@ struct ShotSidecar: Codable {
     let lens: String
     let exposureDuration: Double
     let exposureOffset: Double
+    // Sidecar v2: per-shot capture-device state for calibration grouping and
+    // photometric normalization downstream. Nil when the device isn't observable (iOS < 16).
+    let lensPosition: Float?
+    let iso: Float?
+    let whiteBalanceGains: [Float]?
     let depth: DepthRecord?
 
     enum CodingKeys: String, CodingKey {
@@ -49,6 +54,9 @@ struct ShotSidecar: Codable {
         case lens
         case exposureDuration = "exposure_duration"
         case exposureOffset = "exposure_offset"
+        case lensPosition = "lens_position"
+        case iso
+        case whiteBalanceGains = "white_balance_gains"
         case depth
     }
 }

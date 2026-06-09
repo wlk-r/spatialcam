@@ -1,4 +1,5 @@
 import ARKit
+import AVFoundation
 import Combine
 import CoreImage
 import ImageIO
@@ -25,20 +26,40 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     private let imageExtension = "jpg"
     private let imageCompressionQuality = 0.92
     private let minimumRecommendedFreeBytes: Int64 = 8 * 1024 * 1024 * 1024
+    // A capture fired mid-autofocus-hunt records a defocused image AND intrinsics sampled
+    // during a focal-length transient — the worst of both. Shots wait until the lens has
+    // been still for this long.
+    private let focusSettleInterval: CFTimeInterval = 0.15
+    private let lensPositionEpsilon: Float = 0.005
 
     private weak var session: ARSession?
-    private let writeQueue = DispatchQueue(label: "spatialcam.write", qos: .utility)
+    // All capture-session state and file IO are confined to this one serial queue; the
+    // capture gate and UI state are confined to main. captureHighResolutionFrame completes
+    // on an arbitrary queue, so its result hops to main for validation, then here for work —
+    // two concurrent captures can never touch sessionDir/nextShotIndex/seedCloud at once.
+    private let sessionQueue = DispatchQueue(label: "spatialcam.session", qos: .utility)
     private let ciContext = CIContext(options: nil)
-    private let seedCloud = SeedPointCloud()
 
+    // sessionQueue-confined
+    private let seedCloud = SeedPointCloud()
     private var sessionDir: URL?
+    private var nextShotIndex = 1
+    private var writtenCount = 0
+    private var isAcceptingShots = false
+    private var manifestContext: ManifestContext?
+
+    // main-confined
     private var lastCaptureTransform: simd_float4x4?
     private var isCapturing = false
     private var supportsHiRes = false
     private var supportsDepth = false
-    private var nextShotIndex = 1
     private var isSessionPrepared = false
     private var captureRequestID = 0
+    private var captureDevice: AVCaptureDevice?
+    private var deviceObservers: [NSKeyValueObservation] = []
+    private var isAdjustingFocus = false
+    private var currentLensPosition: Float?
+    private var lastLensMoveTime: CFTimeInterval = 0
 
     func bind(session: ARSession) {
         self.session = session
@@ -74,6 +95,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         }
         isCapturing = false
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        attachCaptureDevice()
         isRunning = true
     }
 
@@ -90,11 +112,14 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
 
     func stop() {
         session?.pause()
+        captureRequestID += 1
+        isCapturing = false
         isRunning = false
         isSessionPrepared = false
         isFinalizing = true
-        writeQueue.async { [weak self] in
+        sessionQueue.async { [weak self] in
             guard let self else { return }
+            self.isAcceptingShots = false
             self.writeSeedCloud()
             self.writeManifest()
             DispatchQueue.main.async {
@@ -130,10 +155,66 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         }
     }
 
+    // MARK: - Focus observation
+
+    private func attachCaptureDevice() {
+        guard #available(iOS 16.0, *), captureDevice == nil,
+              let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera else { return }
+        captureDevice = device
+        // KVO fires on arbitrary threads; mirror onto main where the capture gate reads.
+        deviceObservers = [
+            device.observe(\.isAdjustingFocus, options: [.initial, .new]) { [weak self] _, change in
+                guard let adjusting = change.newValue else { return }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if self.isAdjustingFocus != adjusting {
+                        self.lastLensMoveTime = CACurrentMediaTime()
+                    }
+                    self.isAdjustingFocus = adjusting
+                }
+            },
+            device.observe(\.lensPosition, options: [.initial, .new]) { [weak self] _, change in
+                guard let position = change.newValue else { return }
+                DispatchQueue.main.async {
+                    self?.registerLensPosition(position)
+                }
+            }
+        ]
+    }
+
+    private func registerLensPosition(_ position: Float) {
+        if currentLensPosition.map({ abs(position - $0) > lensPositionEpsilon }) ?? true {
+            lastLensMoveTime = CACurrentMediaTime()
+        }
+        currentLensPosition = position
+    }
+
+    private var isFocusSettled: Bool {
+        // No observable device (iOS < 16): don't gate, behave as before.
+        guard captureDevice != nil else { return true }
+        if isAdjustingFocus { return false }
+        return CACurrentMediaTime() - lastLensMoveTime > focusSettleInterval
+    }
+
+    private func sampleCaptureDevice() -> DeviceSample {
+        guard let device = captureDevice else {
+            return DeviceSample(lensPosition: nil, iso: nil, whiteBalanceGains: nil)
+        }
+        let gains = device.deviceWhiteBalanceGains
+        return DeviceSample(
+            lensPosition: device.lensPosition,
+            iso: device.iso,
+            whiteBalanceGains: [gains.redGain, gains.greenGain, gains.blueGain]
+        )
+    }
+
+    // MARK: - Capture gate
+
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         updateTrackingStatus(frame.camera.trackingState)
         guard isRunning, !isCapturing else { return }
         guard case .normal = frame.camera.trackingState else { return }
+        guard isFocusSettled else { return }
 
         if let last = lastCaptureTransform {
             let dPos = simd_distance(frame.camera.transform.translation, last.translation)
@@ -145,7 +226,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         isCapturing = true
         captureRequestID += 1
         let requestID = captureRequestID
-        captureShot()
+        captureShot(requestID: requestID)
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self else { return }
             if self.captureRequestID == requestID && self.isCapturing {
@@ -154,7 +235,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         }
     }
 
-    private func captureShot() {
+    private func captureShot(requestID: Int) {
         guard let session else {
             isCapturing = false
             return
@@ -162,27 +243,51 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
 
         if #available(iOS 16.0, *), supportsHiRes {
             session.captureHighResolutionFrame { [weak self] hiResFrame, _ in
-                guard let self else { return }
-                if let frame = hiResFrame {
-                    self.handle(frame: frame)
-                } else if let current = session.currentFrame {
-                    self.handle(frame: current)
-                } else {
-                    DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    // Drop the result if a stop, new session, or the watchdog moved on.
+                    guard requestID == self.captureRequestID, self.isCapturing else { return }
+                    if let frame = hiResFrame ?? session.currentFrame {
+                        self.enqueue(frame: frame)
+                    } else {
                         self.isCapturing = false
                     }
                 }
             }
+        } else if let current = session.currentFrame {
+            enqueue(frame: current)
         } else {
-            if let current = session.currentFrame {
-                handle(frame: current)
-            } else {
-                isCapturing = false
+            isCapturing = false
+        }
+    }
+
+    private func enqueue(frame: ARFrame) {
+        pendingWriteCount += 1
+        let deviceSample = sampleCaptureDevice()
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            autoreleasepool {
+                self.process(frame: frame, deviceSample: deviceSample)
             }
         }
     }
 
-    private func handle(frame: ARFrame) {
+    // MARK: - Shot processing (sessionQueue)
+
+    private func process(frame: ARFrame, deviceSample: DeviceSample) {
+        defer {
+            let written = writtenCount
+            let seeds = seedCloud.count
+            DispatchQueue.main.async {
+                self.pendingWriteCount = max(0, self.pendingWriteCount - 1)
+                self.captureCount = written
+                self.seedPointCount = seeds
+                self.isCapturing = false
+            }
+        }
+
+        guard isAcceptingShots, let dir = sessionDir else { return }
+
         let pixelBuffer = frame.capturedImage
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
@@ -192,28 +297,25 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
                                           height: height)
 
         // ARKit can briefly emit non-finite intrinsics/pose/exposure right after (re)start.
-        // JSONEncoder throws on those, which would strand a half-written shot, so drop the
-        // frame before it claims an index — keeps shot indices contiguous.
+        // JSONEncoder throws on those. An index is only claimed after a successful write,
+        // so dropped frames cost nothing and shot indices stay strictly contiguous.
         guard intrinsics.isFinite,
               frame.camera.transform.isFinite,
               frame.camera.exposureDuration.isFinite,
               frame.camera.exposureOffset.isFinite else {
-            DispatchQueue.main.async { self.isCapturing = false }
             return
         }
 
         let index = nextShotIndex
-        nextShotIndex += 1
 
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
-            DispatchQueue.main.async { self.isCapturing = false }
             return
         }
 
         let imageName = String(format: "shot_%04d.%@", index, imageExtension)
-        let depthPayload = extractDepthPayload(frame: frame)
-        recordSeedGeometry(frame: frame, depthPayload: depthPayload)
+        let depthPayload = extractDepthPayload(frame: frame, index: index, dir: dir)
+        recordSeedGeometry(frame: frame)
         let depthRecord = depthPayload.map { payload in
             DepthRecord(
                 file: payload.depthName,
@@ -224,7 +326,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
             )
         }
         let sidecar = ShotSidecar(
-            schemaVersion: 1,
+            schemaVersion: 2,
             index: index,
             timestamp: frame.timestamp,
             image: imageName,
@@ -235,53 +337,36 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
             lens: lensDescription,
             exposureDuration: frame.camera.exposureDuration,
             exposureOffset: Double(frame.camera.exposureOffset),
+            lensPosition: deviceSample.lensPosition,
+            iso: deviceSample.iso,
+            whiteBalanceGains: deviceSample.whiteBalanceGains,
             depth: depthRecord
         )
 
-        DispatchQueue.main.async {
-            self.pendingWriteCount += 1
-        }
-
-        writeQueue.async { [weak self] in
-            autoreleasepool {
-                guard let self else { return }
-                let didWrite = self.persist(cgImage: cgImage, sidecar: sidecar, depthPayload: depthPayload)
-                if didWrite {
-                    self.writeManifest()
-                }
-                DispatchQueue.main.async {
-                    self.pendingWriteCount = max(0, self.pendingWriteCount - 1)
-                    if didWrite {
-                        self.captureCount += 1
-                    }
-                    self.seedPointCount = self.seedCloud.count
-                    self.isCapturing = false
-                }
-            }
+        if persist(cgImage: cgImage, sidecar: sidecar, depthPayload: depthPayload, dir: dir) {
+            nextShotIndex += 1
+            writtenCount += 1
+            writeManifest()
         }
     }
 
-    private func extractDepthPayload(frame: ARFrame) -> DepthPayload? {
-        guard let dir = sessionDir,
-              let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else {
+    private func extractDepthPayload(frame: ARFrame, index: Int, dir: URL) -> DepthPayload? {
+        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else {
             return nil
         }
 
         let depthMap = depthData.depthMap
         let confidenceMap = depthData.confidenceMap
-        let index = nextShotIndex - 1
         let width = CVPixelBufferGetWidth(depthMap)
         let height = CVPixelBufferGetHeight(depthMap)
         let depthName = String(format: "shot_%04d_depth_f32le.raw", index)
         let confidenceName = String(format: "shot_%04d_conf_u8.raw", index)
-        let depthURL = dir.appendingPathComponent(depthName)
-        let confidenceURL = dir.appendingPathComponent(confidenceName)
 
         return DepthPayload(
             depthMap: Self.copyFloatDepth(depthMap),
             confidenceMap: confidenceMap.flatMap(Self.copyConfidence),
-            depthURL: depthURL,
-            confidenceURL: confidenceURL,
+            depthURL: dir.appendingPathComponent(depthName),
+            confidenceURL: dir.appendingPathComponent(confidenceName),
             depthName: depthName,
             confidenceName: confidenceName,
             width: width,
@@ -289,18 +374,20 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         )
     }
 
-    private func recordSeedGeometry(frame: ARFrame, depthPayload: DepthPayload?) {
-        if frame.smoothedSceneDepth ?? frame.sceneDepth != nil,
-           let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth {
-        accumulateDepthPoints(depthData, camera: frame.camera)
+    // MARK: - Seed cloud (sessionQueue)
+
+    private func recordSeedGeometry(frame: ARFrame) {
+        // Sampler locks the captured image for the duration of seed accumulation and
+        // unlocks in deinit; colors feed Brush's splat init (SH DC term).
+        let sampler = YCbCrSampler(pixelBuffer: frame.capturedImage)
+        if let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth {
+            accumulateDepthPoints(depthData, camera: frame.camera, sampler: sampler)
         } else if let featurePoints = frame.rawFeaturePoints {
-            for point in featurePoints.points {
-                seedCloud.insert(point)
-            }
+            accumulateFeaturePoints(featurePoints.points, camera: frame.camera, sampler: sampler)
         }
     }
 
-    private func accumulateDepthPoints(_ depthData: ARDepthData, camera: ARCamera) {
+    private func accumulateDepthPoints(_ depthData: ARDepthData, camera: ARCamera, sampler: YCbCrSampler?) {
         let depthMap = depthData.depthMap
         let confidenceMap = depthData.confidenceMap
         let width = CVPixelBufferGetWidth(depthMap)
@@ -314,6 +401,9 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         let cx = kDepth.columns.2.x
         let cy = kDepth.columns.2.y
         let transform = camera.transform
+        // Depth map and captured image share the same FOV/aspect, so colors map linearly.
+        let imageScaleX = sampler.map { Float($0.width) / Float(width) }
+        let imageScaleY = sampler.map { Float($0.height) / Float(height) }
 
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         if let confidenceMap {
@@ -342,14 +432,54 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
                 let camY = (Float(y) - cy) / fy * z
                 let local = simd_float4(camX, camY, -z, 1)
                 let world = transform * local
-                seedCloud.insert(simd_float3(world.x, world.y, world.z))
+
+                var color = SeedPointCloud.defaultColor
+                if let sampler, let sx = imageScaleX, let sy = imageScaleY {
+                    let imgX = min(sampler.width - 1, Int((Float(x) + 0.5) * sx))
+                    let imgY = min(sampler.height - 1, Int((Float(y) + 0.5) * sy))
+                    if let sampled = sampler.color(atX: imgX, y: imgY) {
+                        color = sampled
+                    }
+                }
+                seedCloud.insert(simd_float3(world.x, world.y, world.z), color: color)
             }
         }
     }
 
-    private func persist(cgImage: CGImage, sidecar: ShotSidecar, depthPayload: DepthPayload?) -> Bool {
-        guard let dir = sessionDir else { return false }
+    private func accumulateFeaturePoints(_ points: [simd_float3], camera: ARCamera, sampler: YCbCrSampler?) {
+        guard let sampler else {
+            for point in points { seedCloud.insert(point) }
+            return
+        }
+        let worldToCamera = simd_inverse(camera.transform)
+        let k = scaledIntrinsics(camera.intrinsics,
+                                 from: camera.imageResolution,
+                                 toWidth: sampler.width,
+                                 height: sampler.height)
+        let fx = k.columns.0.x
+        let fy = k.columns.1.y
+        let cx = k.columns.2.x
+        let cy = k.columns.2.y
 
+        for point in points {
+            let cam = worldToCamera * simd_float4(point, 1)
+            // ARKit camera looks down -Z; image y axis points down while camera +Y is up.
+            let zForward = -cam.z
+            var color = SeedPointCloud.defaultColor
+            if zForward > 0.05 {
+                let u = Int((fx * cam.x / zForward + cx).rounded())
+                let v = Int((fy * -cam.y / zForward + cy).rounded())
+                if let sampled = sampler.color(atX: u, y: v) {
+                    color = sampled
+                }
+            }
+            seedCloud.insert(point, color: color)
+        }
+    }
+
+    // MARK: - Persistence (sessionQueue)
+
+    private func persist(cgImage: CGImage, sidecar: ShotSidecar, depthPayload: DepthPayload?, dir: URL) -> Bool {
         // All-or-nothing: a shot's image/JSON/depth must land together or not at all, otherwise
         // a partial write strands an image (or depth) without its sidecar — the orphan that
         // breaks downstream pairing. On any failure we roll back every file written for this shot.
@@ -401,17 +531,17 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     }
 
     private func writeManifest() {
-        guard let dir = sessionDir else { return }
+        guard let dir = sessionDir, let context = manifestContext else { return }
 
         let manifest = SessionManifest(
             schemaVersion: 1,
-            deviceModel: UIDevice.current.modelIdentifier,
-            hasLidar: supportsDepth,
-            tier: tier.rawValue,
-            systemVersion: UIDevice.current.systemVersion,
+            deviceModel: context.deviceModel,
+            hasLidar: context.hasLidar,
+            tier: context.tier,
+            systemVersion: context.systemVersion,
             worldAlignment: "gravity",
             lens: lensDescription,
-            captureCount: captureCount,
+            captureCount: writtenCount,
             seedPointCount: seedCloud.count,
             seedPointCloud: FileManager.default.fileExists(atPath: dir.appendingPathComponent("seed_points.ply").path) ? "seed_points.ply" : nil,
             depthFormat: "optional per-shot Float32 LE meters plus optional UInt8 confidence",
@@ -426,13 +556,50 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         }
     }
 
-    private func prepareSessionDirectory() {
+    // MARK: - Session lifecycle
+
+    private func prepareNewCaptureSession() {
+        // Snapshot manifest inputs on main; sessionQueue must not touch UIDevice or @Published.
+        let context = ManifestContext(
+            deviceModel: UIDevice.current.modelIdentifier,
+            hasLidar: supportsDepth,
+            tier: tier.rawValue,
+            systemVersion: UIDevice.current.systemVersion
+        )
+        captureCount = 0
+        seedPointCount = 0
+        pendingWriteCount = 0
+        hasCompletedSession = false
+        lastCaptureTransform = nil
+        isCapturing = false
+        trackingStatus = "not_started"
+        isSessionPrepared = true
+
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            let dir = self.createSessionDirectory()
+            self.sessionDir = dir
+            self.seedCloud.reset()
+            self.nextShotIndex = 1
+            self.writtenCount = 0
+            self.manifestContext = context
+            self.isAcceptingShots = dir != nil
+            DispatchQueue.main.async {
+                self.sessionFolderName = dir?.lastPathComponent ?? "No session"
+            }
+        }
+    }
+
+    private func createSessionDirectory() -> URL? {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
         let dir = docs.appendingPathComponent("captures/session_\(stamp)", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        sessionDir = dir
-        sessionFolderName = dir.lastPathComponent
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            return nil
+        }
+        return dir
     }
 
     private func availableDiskBytes() -> Int64? {
@@ -443,20 +610,6 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
 
     private static func formatBytes(_ bytes: Int64) -> String {
         ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-    }
-
-    private func prepareNewCaptureSession() {
-        prepareSessionDirectory()
-        seedCloud.reset()
-        captureCount = 0
-        seedPointCount = 0
-        pendingWriteCount = 0
-        hasCompletedSession = false
-        nextShotIndex = 1
-        lastCaptureTransform = nil
-        isCapturing = false
-        trackingStatus = "not_started"
-        isSessionPrepared = true
     }
 
     private func scaledIntrinsics(_ k: simd_float3x3, from resolution: CGSize, toWidth width: Int, height: Int) -> simd_float3x3 {
@@ -532,6 +685,19 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     }
 }
 
+private struct DeviceSample {
+    let lensPosition: Float?
+    let iso: Float?
+    let whiteBalanceGains: [Float]?
+}
+
+private struct ManifestContext {
+    let deviceModel: String
+    let hasLidar: Bool
+    let tier: String
+    let systemVersion: String
+}
+
 private struct DepthPayload {
     let depthMap: Data
     let confidenceMap: Data?
@@ -541,4 +707,71 @@ private struct DepthPayload {
     let confidenceName: String
     let width: Int
     let height: Int
+}
+
+/// Read-only color sampler over ARKit's bi-planar YCbCr captured image.
+/// Locks the buffer's base addresses for its lifetime; unlocks in deinit.
+private final class YCbCrSampler {
+    private let pixelBuffer: CVPixelBuffer
+    let width: Int
+    let height: Int
+    private let lumaBase: UnsafeRawPointer
+    private let lumaStride: Int
+    private let chromaBase: UnsafeRawPointer
+    private let chromaStride: Int
+    private let isVideoRange: Bool
+
+    init?(pixelBuffer: CVPixelBuffer) {
+        switch CVPixelBufferGetPixelFormatType(pixelBuffer) {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
+            isVideoRange = false
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+            isVideoRange = true
+        default:
+            return nil
+        }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 2,
+              let luma = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+              let chroma = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else {
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+            return nil
+        }
+
+        self.pixelBuffer = pixelBuffer
+        width = CVPixelBufferGetWidth(pixelBuffer)
+        height = CVPixelBufferGetHeight(pixelBuffer)
+        lumaBase = UnsafeRawPointer(luma)
+        lumaStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        chromaBase = UnsafeRawPointer(chroma)
+        chromaStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
+    }
+
+    deinit {
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+    }
+
+    func color(atX x: Int, y: Int) -> SIMD3<UInt8>? {
+        guard x >= 0, x < width, y >= 0, y < height else { return nil }
+        let rawY = Float(lumaBase.advanced(by: y * lumaStride).assumingMemoryBound(to: UInt8.self)[x])
+        let chromaRow = chromaBase.advanced(by: (y / 2) * chromaStride).assumingMemoryBound(to: UInt8.self)
+        let cbIndex = (x / 2) * 2
+        let rawCb = Float(chromaRow[cbIndex])
+        let rawCr = Float(chromaRow[cbIndex + 1])
+
+        // BT.709 YCbCr -> RGB (expand video range first when needed).
+        let yv = isVideoRange ? (rawY - 16) * (255.0 / 219.0) : rawY
+        let chromaScale: Float = isVideoRange ? 255.0 / 224.0 : 1
+        let cb = (rawCb - 128) * chromaScale
+        let cr = (rawCr - 128) * chromaScale
+        let r = yv + 1.5748 * cr
+        let g = yv - 0.1873 * cb - 0.4681 * cr
+        let b = yv + 1.8556 * cb
+        return SIMD3<UInt8>(
+            UInt8(clamping: Int(r.rounded())),
+            UInt8(clamping: Int(g.rounded())),
+            UInt8(clamping: Int(b.rounded()))
+        )
+    }
 }

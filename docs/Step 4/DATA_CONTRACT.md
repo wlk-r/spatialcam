@@ -1,8 +1,9 @@
-# Data Contract — capture sidecar & manifest (v1)
+# Data Contract — capture sidecar & manifest (sidecar v2, manifest v1)
 
 The interface between the **iOS capture app** (writer) and the **desktop exporter** (reader).
-Both sides treat this as frozen for v1; changes bump the version and the manifest's
-`arkit_to_colmap_conversion_version`.
+Changes bump the relevant `schema_version` and the manifest's
+`arkit_to_colmap_conversion_version`. Sidecar v2 is a strictly additive change over v1
+(three optional capture-device fields); v1 readers can ignore the new keys.
 
 A session is one directory: `session_<ISO8601>/` containing `manifest.json`, a possible
 `seed_points.ply`, and per shot `shot_NNNN.jpg` + `shot_NNNN.json` (NNNN zero-padded,
@@ -19,6 +20,10 @@ A session is one directory: `session_<ISO8601>/` containing `manifest.json`, a p
 - The **ARKit→COLMAP flip is NOT applied here** — it lives only in the exporter (step 4).
 - Focus is **unlocked**, so `intrinsics` drift frame to frame (autofocus). This is intentional —
   the per-frame values are the contract; readers must use them per shot, not assume one shared model.
+- **Shots are gated on a settled lens** (sidecar v2 writer): no capture fires while autofocus is
+  hunting, so a sidecar's `intrinsics`/`lens_position` always describe a stationary focal length,
+  never a mid-transient one. `lens_position` lets readers cluster shots into a few calibration
+  groups instead of treating every image as its own camera.
 
 ## Writer guarantees
 
@@ -27,9 +32,10 @@ A session is one directory: `session_<ISO8601>/` containing `manifest.json`, a p
   sidecar.
 - **Finite-only.** Frames whose intrinsics/pose/exposure are non-finite (ARKit can emit these right
   after a reset) are dropped *before* claiming an index — they never produce partial files.
-- **Contiguity.** Indices are 1-based and contiguous except where a frame was dropped per above. A
-  dropped frame is a clean gap (no files), never an orphan. `audit_session.py` fails on orphan
-  files (any `shot_*` with no sidecar) and on index gaps.
+- **Contiguity.** Indices are 1-based and strictly contiguous. The v2 writer claims an index only
+  after a successful write, so dropped or failed frames consume nothing — no gaps, never an orphan.
+  (The v1 writer could leave a clean gap where a frame was dropped.) `audit_session.py` fails on
+  orphan files (any `shot_*` with no sidecar) and on index gaps.
 
 ## `shot_NNNN.json`
 
@@ -45,6 +51,9 @@ A session is one directory: `session_<ISO8601>/` containing `manifest.json`, a p
 | `lens` | string | descriptive lens id for the session. |
 | `exposure_duration` | float | seconds; for post photometric normalization. |
 | `exposure_offset` | float | EV offset; ditto. |
+| `lens_position` | float? | v2. Normalized lens position (0 near … 1 far) at capture; absent when the capture device isn't observable (iOS < 16). Cluster on this for shared calibration groups. |
+| `iso` | float? | v2. Sensor ISO at capture; with `exposure_duration`, recovers relative scene radiance for photometric normalization. |
+| `white_balance_gains` | float[3]? | v2. Device RGB white-balance gains at capture; lets a reader undo per-shot AWB drift for color-consistent splat training. |
 | `depth` | object/null | Optional LiDAR files and format metadata. |
 
 When present, `depth` contains:

@@ -70,6 +70,24 @@ Current expected answers:
 - Captured camera/depth/pose data stays local and is user-exported.
 - No custom encryption implemented by the app.
 
+## Planned: capture profile toggle (focus / exposure / white balance lock)
+
+The app currently runs fully auto (autofocus, auto exposure, AWB) and instead records the
+device state per shot (`lens_position`, `iso`, `white_balance_gains` in sidecar v2) so the
+exporter can accommodate drift after the fact. A future capture-profile toggle should offer:
+
+- **Subject (auto)** — today's behavior. Best for mixed near/far scenes and closeups; the
+  focus-settled gate already prevents mid-hunt captures.
+- **Scene (locked)** — tap-to-focus then `setFocusModeLocked`, plus optional exposure and
+  white-balance locks, via `configurableCaptureDeviceForPrimaryCamera`. Best for room-scale
+  or constant-distance orbits: one shared calibration group (tighter Metashape/COLMAP BA)
+  and view-consistent radiometry for splat training. DoF math: locked at ~2.2 m the f/1.78
+  wide camera is sharp roughly 1.6–3.5 m; no lock distance covers both 0.7 m closeups and
+  6 m walls, hence the toggle rather than a global lock.
+
+When added: record `focus_mode` / `exposure_mode` / `white_balance_mode` in `manifest.json`,
+and have the exporter emit one shared COLMAP camera when focus was locked.
+
 ## Known Future Improvement
 
 If instant readiness becomes important, refactor the app state instead of adding preview as a separate mode.
