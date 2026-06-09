@@ -24,9 +24,13 @@ python validate.py selftest
 python export_colmap.py --session "$SESSION" --out "$OUT"
 
 # 2) Features + matches. single_camera 0 => one camera per image (matches per-frame intrinsics).
+# single_camera_per_image is required: with EXIF embedded (sidecar-v2 captures) all
+# images share Make/Model/focal, so COLMAP would otherwise collapse them onto ONE
+# shared camera and the per-image manual model would have duplicate CAMERA_IDs
+# (point_triangulator aborts on load).
 colmap feature_extractor \
   --database_path "$DB" --image_path "$IMAGES" \
-  --ImageReader.camera_model PINHOLE --ImageReader.single_camera 0 \
+  --ImageReader.camera_model PINHOLE --ImageReader.single_camera_per_image 1 \
   --SiftExtraction.estimate_affine_shape 1 --SiftExtraction.domain_size_pooling 1
 
 if [ "$MATCHER" = "exhaustive" ]; then

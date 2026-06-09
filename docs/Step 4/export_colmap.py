@@ -91,6 +91,11 @@ def main():
             f"{t[0]:.10g} {t[1]:.10g} {t[2]:.10g} {camera_id} {name}")
         img_lines.append("")  # empty POINTS2D — point_triangulator fills these
 
+    camera_ids = [line.split()[0] for line in cam_lines]
+    if len(set(camera_ids)) != len(camera_ids):
+        sys.exit("duplicate CAMERA_IDs: the database shares cameras between images "
+                 "(extract with --ImageReader.single_camera_per_image 1, or repair the "
+                 "DB to one camera per image) — point_triangulator would abort on this model")
     (model_dir / "cameras.txt").write_text(
         "# CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[fx,fy,cx,cy]\n" + "\n".join(cam_lines) + "\n")
     (model_dir / "images.txt").write_text(
