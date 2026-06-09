@@ -238,6 +238,9 @@ def main():
     ap.add_argument("--copy", action="store_true", help="copy images instead of symlinking")
     ap.add_argument("--fuse-depth", action="store_true",
                     help="fuse per-shot LiDAR depth (confidence==2) into the seed cloud")
+    ap.add_argument("--no-seed", action="store_true",
+                    help="ignore seed_points.ply (use with --fuse-depth for sessions "
+                         "captured before the Y-sign fix, whose seed clouds are mirrored)")
     ap.add_argument("--fuse-stride", type=int, default=2,
                     help="sample every Nth depth pixel when fusing (default 2)")
     ap.add_argument("--fuse-voxel", type=float, default=0.015,
@@ -304,7 +307,9 @@ def main():
 
     # points3D.txt from seed cloud (+ optional LiDAR depth fusion)
     ply = session / "seed_points.ply"
-    if ply.exists():
+    if args.no_seed:
+        xyz, rgb = np.zeros((0, 3)), np.zeros((0, 3), np.uint8)
+    elif ply.exists():
         xyz, rgb = read_ply_xyzrgb(ply)
     else:
         print(f"warning: no seed_points.ply in {session}", file=sys.stderr)
