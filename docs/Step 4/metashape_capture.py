@@ -113,7 +113,74 @@ def configure_per_frame_sensors(chunk: Metashape.Chunk, by_label: dict, fixed: b
         chunk.remove(orphaned)
 
 
-def make_document(session: Path, out: Path, shots: list[dict], location_accuracy: float, fixed_intrinsics: bool, orientation_priors: bool, rotation_accuracy: float) -> tuple[Metashape.Document, Metashape.Chunk]:
+def configure_lens_grouped_sensors(chunk: Metashape.Chunk, by_label: dict, bin_width: float, fixed: bool) -> None:
+    """Cluster photos into calibration groups by recorded lens_position (sidecar v2).
+
+    Unlike per-frame sensors (single-image groups, which cannot self-calibrate), a
+    lens-position bin holds many images at effectively the same focus, so Metashape
+    has enough observations to refine f/cx/cy and distortion per group while the
+    recorded ARKit intrinsics (averaged over the group) serve as the initialization.
+    Cameras without lens_position (v1 captures) stay on the shared sensor.
+    """
+    bins: dict[int, list] = {}
+    missing = 0
+    for camera in chunk.cameras:
+        shot = by_label.get(camera.label)
+        lens_position = shot.get("lens_position") if shot else None
+        if lens_position is None:
+            missing += 1
+            continue
+        bins.setdefault(int(round(lens_position / bin_width)), []).append((camera, shot))
+    if missing:
+        print(f"warn: {missing} cameras lack lens_position; left on shared sensor")
+
+    shared = list(chunk.sensors)
+    base = shared[0] if shared else None
+    for key, members in sorted(bins.items()):
+        width, height = (int(v) for v in members[0][1]["resolution"])
+        n = len(members)
+        fx = sum(s["intrinsics"][0][0] for _, s in members) / n
+        fy = sum(s["intrinsics"][1][1] for _, s in members) / n
+        cx = sum(s["intrinsics"][0][2] for _, s in members) / n
+        cy = sum(s["intrinsics"][1][2] for _, s in members) / n
+
+        sensor = chunk.addSensor()
+        sensor.label = f"arkit_lens_{key}"
+        sensor.type = base.type if base is not None else Metashape.Sensor.Type.Frame
+        sensor.width = width
+        sensor.height = height
+        if base is not None:
+            try:
+                sensor.pixel_size = base.pixel_size
+                sensor.focal_length = base.focal_length
+            except Exception:
+                pass
+        try:
+            sensor.rolling_shutter = Metashape.Shutter.Model.Full
+        except Exception:
+            pass
+
+        calibration = Metashape.Calibration()
+        calibration.width = width
+        calibration.height = height
+        calibration.f = fy
+        calibration.b1 = fx - fy
+        calibration.cx = cx - width / 2.0
+        calibration.cy = cy - height / 2.0
+        sensor.user_calib = calibration
+        sensor.fixed_calibration = fixed
+        sensor.fixed = False
+        for camera, _ in members:
+            camera.sensor = sensor
+        print(f"lens group {key}: {n} photos (lens_position ~{key * bin_width:.2f}, fx ~{fx:.1f})")
+
+    if not missing:
+        orphaned = [s for s in shared if all(c.sensor is not s for c in chunk.cameras)]
+        if orphaned:
+            chunk.remove(orphaned)
+
+
+def make_document(session: Path, out: Path, shots: list[dict], location_accuracy: float, fixed_intrinsics: bool, orientation_priors: bool, rotation_accuracy: float, lens_groups: float | None) -> tuple[Metashape.Document, Metashape.Chunk]:
     doc = Metashape.Document()
     chunk = doc.addChunk()
     chunk.label = "spatialcam"
@@ -144,7 +211,10 @@ def make_document(session: Path, out: Path, shots: list[dict], location_accuracy
             camera.reference.rotation = ypr
             camera.reference.rotation_accuracy = Metashape.Vector([rotation_accuracy] * 3)
 
-    configure_per_frame_sensors(chunk, by_label, fixed=fixed_intrinsics)
+    if lens_groups is not None:
+        configure_lens_grouped_sensors(chunk, by_label, bin_width=lens_groups, fixed=fixed_intrinsics)
+    else:
+        configure_per_frame_sensors(chunk, by_label, fixed=fixed_intrinsics)
 
     doc.save(str(out / "project.psx"))
     return doc, doc.chunks[0]
@@ -279,6 +349,7 @@ def run(args: argparse.Namespace) -> None:
             fixed_intrinsics=args.fixed_intrinsics,
             orientation_priors=not args.no_orientation_priors,
             rotation_accuracy=args.rotation_accuracy,
+            lens_groups=args.lens_groups,
         )
         align_and_optimize(
             doc,
@@ -313,6 +384,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rotation-accuracy", type=float, default=2.0, help="ARKit orientation prior accuracy (deg).")
     parser.add_argument("--no-orientation-priors", action="store_true", help="Disable ARKit rotation priors / 6DoF init (position-only).")
     parser.add_argument("--fixed-intrinsics", action="store_true")
+    parser.add_argument("--lens-groups", nargs="?", const=0.05, type=float, default=None,
+                        help="Cluster photos into calibration groups by sidecar-v2 lens_position "
+                             "(optional bin width, default 0.05) so groups can self-calibrate; "
+                             "without this every photo gets its own fixed-by-trust sensor.")
     parser.add_argument("--export-only", action="store_true")
     return parser.parse_args()
 
