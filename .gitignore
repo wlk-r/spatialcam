@@ -1,0 +1,51 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode user-local state
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+DerivedData/
+*.moved-aside
+*.xcuserdatad/
+
+# Build products and archives
+build/
+Build/
+*.ipa
+*.dSYM
+*.dSYM.zip
+*.xcarchive
+*.xcresult
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Package.resolved
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Device debug output and copied app containers
+device-debug/
+*.xcappdata/
+
+# Generated reconstruction/training artifacts
+target/
+brush_smoketest/
+brush_15k/
+brush_dataset/
+*.psx
+*.files/
+camera_diagnostics.csv
+metashape_capture_summary.json
+source_manifest.json
+
+# Capture sessions copied out of the phone
+session_*/
+captures/
