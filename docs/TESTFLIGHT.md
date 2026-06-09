@@ -18,11 +18,16 @@ Use this text for TestFlight test information:
 3Dgs Capture is a beta 3D capture utility for testing iPhone/ARKit data capture for structure-from-motion workflows.
 
 What to test:
-1. Open the app and grant camera access.
+1. Open the app and grant camera access. The camera preview is live immediately;
+   wait for the status to read "Tracking ready".
 2. Tap Start.
-3. Slowly scan a room or connected spaces.
+3. Slowly scan a room or connected spaces. The screen stays awake while recording.
 4. Tap Stop and wait until the app reports all files written.
-5. Use Finder, Files, or AirDrop to retrieve the generated session folder.
+5. Send the capture back:
+   - Open the Files app > On My iPhone > 3Dgs Capture > captures.
+   - Long-press the session folder > Compress.
+   - Share the resulting .zip (AirDrop, iCloud link, or Mail). Sessions can be
+     several GB, so AirDrop or an iCloud/Drive link is usually best.
 
 The app captures camera images, ARKit camera poses, camera intrinsics, LiDAR depth/confidence data when available, exposure metadata, and a local manifest. Captures are stored locally on device. The app does not upload data, use accounts, or track users.
 ```

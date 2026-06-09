@@ -115,6 +115,8 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         }
         isCapturing = false
         isRecording = true
+        // A scan runs for minutes without touches; don't let the screen lock mid-capture.
+        UIApplication.shared.isIdleTimerDisabled = true
     }
 
     func newCapture() {
@@ -136,6 +138,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         isRecording = false
         isSessionPrepared = false
         isFinalizing = true
+        UIApplication.shared.isIdleTimerDisabled = false
         sessionQueue.async { [weak self] in
             guard let self else { return }
             self.isAcceptingShots = false
