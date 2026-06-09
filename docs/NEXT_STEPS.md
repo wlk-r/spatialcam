@@ -15,15 +15,27 @@ Current objective: distribute a beta build by TestFlight link/email, not App Sto
 - Camera permission: `NSCameraUsageDescription` in `spatialcam/Info.plist`
 - File sharing: enabled via `UIFileSharingEnabled` and `LSSupportsOpeningDocumentsInPlace`
 
-The current capture lifecycle is intentionally conservative:
+The capture lifecycle is always-on with a recording gate (the shape previously sketched
+under "Known Future Improvement", now implemented):
 
-- No AR camera preview before `Start`.
+- The full capture-capable ARWorldTrackingConfiguration runs from app open; the camera
+  preview is live before `Start`.
 - Capability/tier detection runs on app open.
-- `Start` creates a new capture session folder and starts ARKit capture.
-- `Stop` pauses ARKit and finalizes image/depth/metadata writes.
-- The UI should show `Ready` while idle, not `Starting`.
+- `Start` creates a new capture session folder and opens the recording gate — no
+  `session.run`, no tracking reset, so recording begins on already-converged VIO.
+- `Stop` closes the gate and finalizes image/depth/metadata writes; the session keeps
+  running for instant restart.
+- Interruptions (calls, app switch) and session failures are handled in
+  `CaptureSessionManager` (status surfaces as `interrupted`/`failed`; failures retry).
 
-Do not reintroduce a separate pre-start AR preview right before TestFlight. It caused camera stack churn on iPhone 13 Pro / iOS 26.5 and led to captures stalling after one frame.
+There is exactly ONE ARKit configuration in the app, ever. Do not add a second
+"preview" configuration or switch configurations at Start/Stop — configuration
+switching caused camera stack churn on iPhone 13 Pro / iOS 26.5 and led to captures
+stalling after one frame. Before any TestFlight build, re-run the clean-device test
+below on that device class to confirm the always-on lifecycle stays healthy. Idle
+thermal/battery cost of the always-on session is accepted for now; if it becomes a
+problem, add an idle timeout that pauses the session after a few minutes, not a
+second configuration.
 
 ## Required Before TestFlight Review
 
@@ -88,19 +100,15 @@ exporter can accommodate drift after the fact. A future capture-profile toggle s
 When added: record `focus_mode` / `exposure_mode` / `white_balance_mode` in `manifest.json`,
 and have the exporter emit one shared COLMAP camera when focus was locked.
 
-## Known Future Improvement
+## Implemented: instant readiness (always-on session)
 
-If instant readiness becomes important, refactor the app state instead of adding preview as a separate mode.
-
-Recommended shape:
-
-- `isSessionRunning`: ARKit is live and updating tracking.
-- `isRecording`: captures are being written.
-- Start a full capture-compatible ARWorldTrackingConfiguration on app open.
-- On `Start`, create a folder, reset counters, and set `isRecording = true`.
-- On `Stop`, set `isRecording = false`, finalize files, and optionally keep ARKit running.
-
-This avoids switching AR configurations between preview and recording, but it should be tested carefully on-device before external distribution.
+The state refactor described in earlier notes is done: `isSessionRunning` (ARKit live)
+is split from `isRecording` (captures being written), the session runs one
+capture-compatible configuration from app open, and `Start`/`Stop` only toggle the
+recording gate. World origin is wherever the session began rather than reset per
+recording; each session's poses remain self-consistent and gravity-aligned, which is
+all the data contract requires. Must be tested carefully on-device (especially
+iPhone 13 Pro class) before external distribution.
 
 ## Verified Locally
 

@@ -104,7 +104,7 @@ struct ContentView: View {
     }
 
     private var captureButtonTitle: String {
-        if manager.isRunning {
+        if manager.isRecording {
             return "Stop"
         }
         if manager.isFinalizing {
@@ -117,7 +117,7 @@ struct ContentView: View {
     }
 
     private func handleCaptureButton() {
-        if manager.isRunning {
+        if manager.isRecording {
             manager.stop()
         } else if manager.hasCompletedSession {
             manager.newCapture()
@@ -142,7 +142,7 @@ struct ContentView: View {
     }
 
     private var buttonColor: Color {
-        if manager.isRunning {
+        if manager.isRecording {
             return .red
         }
         if manager.isFinalizing {
@@ -152,7 +152,7 @@ struct ContentView: View {
     }
 
     private var sessionStatusText: String {
-        if manager.isRunning {
+        if manager.isRecording {
             return "Recording \(manager.sessionFolderName)"
         }
         if manager.isFinalizing {
@@ -180,6 +180,10 @@ struct ContentView: View {
             return "Need texture"
         case "limited:relocalizing":
             return "Relocalizing"
+        case "interrupted":
+            return "Camera paused"
+        case "failed":
+            return "Camera failed"
         default:
             return "Tracking limited"
         }

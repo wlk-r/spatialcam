@@ -10,7 +10,8 @@ import UIKit
 final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published private(set) var captureCount = 0
     @Published private(set) var seedPointCount = 0
-    @Published private(set) var isRunning = false
+    @Published private(set) var isSessionRunning = false
+    @Published private(set) var isRecording = false
     @Published private(set) var trackingStatus = "not_started"
     @Published private(set) var tier: CaptureTier = .vioFallback
     @Published private(set) var sessionFolderName = "No session"
@@ -24,7 +25,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     private let lensDescription = "builtInWideAngleCamera"
     private let imageUTType = UTType.jpeg
     private let imageExtension = "jpg"
-    private let imageCompressionQuality = 0.92
+    private let imageCompressionQuality = 0.95
     private let minimumRecommendedFreeBytes: Int64 = 8 * 1024 * 1024 * 1024
     // A capture fired mid-autofocus-hunt records a defocused image AND intrinsics sampled
     // during a focal-length transient — the worst of both. Shots wait until the lens has
@@ -65,17 +66,19 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         self.session = session
         session.delegate = self
         DispatchQueue.main.async { [weak self] in
-            self?.detectCapabilities()
+            guard let self else { return }
+            self.detectCapabilities()
+            self.runSession()
         }
     }
 
-    func start() {
-        guard let session, !isFinalizing else { return }
-
-        detectCapabilities()
-        if !isSessionPrepared {
-            prepareNewCaptureSession()
-        }
+    // The session runs continuously from app open with the one capture-capable
+    // configuration; Start/Stop only toggle the recording gate. Recording therefore
+    // begins on already-converged VIO (no warm-up wobble in the first shots), and no
+    // configuration switch ever touches the camera stack — the churn that stalled
+    // captures on iPhone 13 Pro / iOS 26.5.
+    private func runSession() {
+        guard let session else { return }
 
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
@@ -93,14 +96,29 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
             config.frameSemantics.insert(.sceneDepth)
         }
-        isCapturing = false
-        session.run(config, options: [.resetTracking, .removeExistingAnchors])
+
+        // No reset options: tracking stays converged across recordings. The world
+        // origin is wherever the session began, which the data contract permits —
+        // each session's poses are self-consistent and gravity-aligned.
+        session.run(config)
         attachCaptureDevice()
-        isRunning = true
+        isSessionRunning = true
+    }
+
+    func start() {
+        guard session != nil, !isFinalizing, !isRecording else { return }
+        if !isSessionRunning {
+            runSession()
+        }
+        if !isSessionPrepared {
+            prepareNewCaptureSession()
+        }
+        isCapturing = false
+        isRecording = true
     }
 
     func newCapture() {
-        guard !isRunning, !isFinalizing else { return }
+        guard !isRecording, !isFinalizing else { return }
         prepareNewCaptureSession()
     }
 
@@ -111,10 +129,11 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     }
 
     func stop() {
-        session?.pause()
+        // The session keeps running — only the recording gate closes, so the next
+        // recording starts instantly on still-converged tracking.
         captureRequestID += 1
         isCapturing = false
-        isRunning = false
+        isRecording = false
         isSessionPrepared = false
         isFinalizing = true
         sessionQueue.async { [weak self] in
@@ -208,11 +227,44 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         )
     }
 
+    // MARK: - Session observation
+
+    // The always-on session lives across phone calls, app switches, and camera
+    // contention, so interruptions and failures must be handled here rather than
+    // by the user pressing Start again.
+
+    func sessionWasInterrupted(_ session: ARSession) {
+        // No frames arrive while interrupted, so this status persists until ARKit
+        // resumes and the next didUpdate overwrites it.
+        DispatchQueue.main.async {
+            self.trackingStatus = "interrupted"
+        }
+    }
+
+    func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool {
+        // Keep the world frame across interruptions so an in-progress recording's
+        // poses stay in one consistent coordinate system.
+        true
+    }
+
+    func session(_ session: ARSession, didFailWithError error: Error) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isSessionRunning = false
+            self.trackingStatus = "failed"
+            // e.g. camera became unavailable; retry once the system settles.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self, !self.isSessionRunning else { return }
+                self.runSession()
+            }
+        }
+    }
+
     // MARK: - Capture gate
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         updateTrackingStatus(frame.camera.trackingState)
-        guard isRunning, !isCapturing else { return }
+        guard isRecording, !isCapturing else { return }
         guard case .normal = frame.camera.trackingState else { return }
         guard isFocusSettled else { return }
 
@@ -572,7 +624,6 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         hasCompletedSession = false
         lastCaptureTransform = nil
         isCapturing = false
-        trackingStatus = "not_started"
         isSessionPrepared = true
 
         sessionQueue.async { [weak self] in
