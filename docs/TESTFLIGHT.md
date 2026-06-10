@@ -21,7 +21,23 @@ What to test:
 1. Open the app and grant camera access. The camera preview is live immediately;
    wait for the status to read "Tracking ready".
 2. Tap Start.
-3. Slowly scan a room or connected spaces. The screen stays awake while recording.
+3. Scan slowly and deliberately — walking pace, smooth movements. The screen
+   stays awake while recording.
+   - Hold the phone at chest height and keep it moving in slow arcs. Step
+     sideways and forward rather than pivoting in place — changing position is
+     what gives the capture depth.
+   - Favor long sightlines: frame shots that see across the room, with plenty
+     of visual detail in view (furniture, edges, floor texture). Avoid
+     close-ups of bare walls or ceilings.
+   - Cover each area from a few different angles, but one thorough pass is
+     enough — no need to re-walk the same path. Finish near where you started.
+   - Doorways: capture the doorway clearly from inside the first room, walk
+     through slowly, then capture it again from the second room. This is what
+     stitches rooms together.
+   - Glass walls and windows: approach at an angle, never square-on (head-on
+     glass shows reflections and your own mirror image instead of the scene).
+     Include the frames, mullions, and solid edges around the glass. Don't
+     linger aimed directly into the bright window — it throws off exposure.
 4. Tap Stop and wait until the app reports all files written.
 5. Send the capture back: tap the share button next to Start. The app prepares
    a .zip (can take a few minutes on long captures; keep the app open), then
