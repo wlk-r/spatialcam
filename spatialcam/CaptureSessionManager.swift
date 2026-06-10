@@ -41,7 +41,17 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     // on an arbitrary queue, so its result hops to main for validation, then here for work —
     // two concurrent captures can never touch sessionDir/nextShotIndex/seedCloud at once.
     private let sessionQueue = DispatchQueue(label: "spatialcam.session", qos: .utility)
+    // Zips must NOT share sessionQueue: a multi-minute archive would block shot
+    // processing, and queued shots retain their ARFrames — ARKit stalls the camera
+    // once a delegate holds more than a handful. The completed session's files are
+    // finished before completedSessionURL publishes, so reading them here is safe
+    // while a new session records.
+    private let shareQueue = DispatchQueue(label: "spatialcam.share", qos: .userInitiated)
     private let ciContext = CIContext(options: nil)
+    // Backpressure for the capture gate: the 2 s watchdog can reopen the gate while
+    // earlier shots are still writing, so bound how many ARFrames may be queued
+    // (each retains a full hi-res capture, and ARKit stops the camera past ~a dozen).
+    private let maxPendingWrites = 3
 
     // sessionQueue-confined
     private let seedCloud = SeedPointCloud()
@@ -177,7 +187,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
         // A multi-GB zip takes minutes with no touches; a screen lock would suspend
         // the app and stall it mid-archive.
         UIApplication.shared.isIdleTimerDisabled = true
-        sessionQueue.async { [weak self] in
+        shareQueue.async { [weak self] in
             guard let self else { return }
             let finish: (Result<URL, Error>) -> Void = { result in
                 DispatchQueue.main.async {
@@ -359,6 +369,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         updateTrackingStatus(frame.camera.trackingState)
         guard isRecording, !isCapturing else { return }
+        guard pendingWriteCount < maxPendingWrites else { return }
         guard case .normal = frame.camera.trackingState else { return }
         guard isFocusSettled else { return }
 
