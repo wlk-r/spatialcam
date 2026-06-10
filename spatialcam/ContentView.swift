@@ -117,7 +117,7 @@ struct ContentView: View {
                         .background(buttonColor, in: RoundedRectangle(cornerRadius: 8))
                         .foregroundStyle(.white)
                 }
-                .disabled(manager.isFinalizing)
+                .disabled(manager.isFinalizing || manager.isPreparingShare)
             }
 
             writeStatus
@@ -202,7 +202,7 @@ struct ContentView: View {
         if manager.isRecording {
             return .red
         }
-        if manager.isFinalizing {
+        if manager.isFinalizing || manager.isPreparingShare {
             return .gray
         }
         return .accentColor

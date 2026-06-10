@@ -118,7 +118,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     }
 
     func start() {
-        guard session != nil, !isFinalizing, !isRecording else { return }
+        guard session != nil, !isFinalizing, !isRecording, !isPreparingShare else { return }
         if !isSessionRunning {
             runSession()
         }
@@ -132,7 +132,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     }
 
     func newCapture() {
-        guard !isRecording, !isFinalizing else { return }
+        guard !isRecording, !isFinalizing, !isPreparingShare else { return }
         prepareNewCaptureSession()
     }
 
