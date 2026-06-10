@@ -174,26 +174,31 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     func prepareShareArchive(completion: @escaping (Result<URL, Error>) -> Void) {
         guard let sessionURL = completedSessionURL, !isPreparingShare else { return }
         isPreparingShare = true
+        // A multi-GB zip takes minutes with no touches; a screen lock would suspend
+        // the app and stall it mid-archive.
+        UIApplication.shared.isIdleTimerDisabled = true
         sessionQueue.async { [weak self] in
             guard let self else { return }
             let finish: (Result<URL, Error>) -> Void = { result in
                 DispatchQueue.main.async {
                     self.isPreparingShare = false
+                    UIApplication.shared.isIdleTimerDisabled = self.isRecording
                     completion(result)
                 }
             }
 
-            // The zip is roughly session-sized (JPEGs don't recompress); demand that
-            // plus headroom before writing multi-GB into the temp directory.
+            // The zip is roughly session-sized (JPEGs don't recompress), and if the
+            // move below falls back to a copy, the coordinator's zip and ours coexist
+            // briefly — so demand 2x the session plus headroom.
             let sessionSize = Self.directorySize(of: sessionURL)
-            if let available = self.availableDiskBytes(), available < sessionSize + 200 * 1024 * 1024 {
-                finish(.failure(ShareArchiveError.insufficientSpace(needed: sessionSize, available: available)))
+            if let available = self.availableDiskBytes(), available < sessionSize * 2 + 200 * 1024 * 1024 {
+                finish(.failure(ShareArchiveError.insufficientSpace(needed: sessionSize * 2, available: available)))
                 return
             }
 
             // .forUploading hands back a zipped copy of the directory — the system's
             // own folder-zipping path, no archive library needed. The zip only lives
-            // for the block, so copy it out to temp before returning.
+            // for the block, so move (or copy) it out to temp before returning.
             var coordinatorError: NSError?
             var result: Result<URL, Error> = .failure(ShareArchiveError.archiveFailed)
             NSFileCoordinator().coordinate(readingItemAt: sessionURL, options: [.forUploading], error: &coordinatorError) { zipped in
@@ -202,7 +207,12 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
                         .appendingPathComponent(sessionURL.lastPathComponent)
                         .appendingPathExtension("zip")
                     try? FileManager.default.removeItem(at: destination)
-                    try FileManager.default.copyItem(at: zipped, to: destination)
+                    do {
+                        // Move avoids a second multi-GB write (and the 2x disk peak).
+                        try FileManager.default.moveItem(at: zipped, to: destination)
+                    } catch {
+                        try FileManager.default.copyItem(at: zipped, to: destination)
+                    }
                     result = .success(destination)
                 } catch {
                     result = .failure(error)
