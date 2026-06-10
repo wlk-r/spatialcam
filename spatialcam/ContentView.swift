@@ -227,7 +227,7 @@ struct ContentView: View {
     private var trackingStatusText: String {
         switch manager.trackingStatus {
         case "normal":
-            return "Tracking ready"
+            return manager.trackingWasReset ? "Ready (tracking restarted)" : "Tracking ready"
         case "not_started":
             return "Ready"
         case "not_available":

@@ -20,6 +20,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     @Published private(set) var hasCompletedSession = false
     @Published private(set) var completedSessionURL: URL?
     @Published private(set) var isPreparingShare = false
+    @Published private(set) var trackingWasReset = false
 
     private let translationThreshold: Float = 0.12
     private let rotationThreshold: Float = .pi / 30
@@ -34,6 +35,9 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     // been still for this long.
     private let focusSettleInterval: CFTimeInterval = 0.15
     private let lensPositionEpsilon: Float = 0.005
+    // Relocalization can't succeed if the camera resumed somewhere unmapped (e.g.
+    // the user walked away during a share); past this, restart tracking fresh.
+    private let relocalizationTimeout: CFTimeInterval = 10
 
     private weak var session: ARSession?
     // All capture-session state and file IO are confined to this one serial queue; the
@@ -73,6 +77,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     private var isAdjustingFocus = false
     private var currentLensPosition: Float?
     private var lastLensMoveTime: CFTimeInterval = 0
+    private var relocalizingSince: CFTimeInterval?
 
     func bind(session: ARSession) {
         self.session = session
@@ -89,7 +94,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     // begins on already-converged VIO (no warm-up wobble in the first shots), and no
     // configuration switch ever touches the camera stack — the churn that stalled
     // captures on iPhone 13 Pro / iOS 26.5.
-    private func runSession() {
+    private func runSession(resetTracking: Bool = false) {
         guard let session else { return }
 
         let config = ARWorldTrackingConfiguration()
@@ -109,10 +114,11 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
             config.frameSemantics.insert(.sceneDepth)
         }
 
-        // No reset options: tracking stays converged across recordings. The world
-        // origin is wherever the session began, which the data contract permits —
-        // each session's poses are self-consistent and gravity-aligned.
-        session.run(config)
+        // Normally no reset options: tracking stays converged across recordings, and
+        // the world origin is wherever the session began (the data contract permits
+        // this — each session's poses are self-consistent and gravity-aligned).
+        // resetTracking is the stuck-relocalization escape hatch only.
+        session.run(config, options: resetTracking ? [.resetTracking, .removeExistingAnchors] : [])
         attachCaptureDevice()
         isSessionRunning = true
     }
@@ -126,6 +132,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
             prepareNewCaptureSession()
         }
         isCapturing = false
+        trackingWasReset = false
         isRecording = true
         // A scan runs for minutes without touches; don't let the screen lock mid-capture.
         UIApplication.shared.isIdleTimerDisabled = true
@@ -380,6 +387,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         updateTrackingStatus(frame.camera.trackingState)
+        recoverFromStuckRelocalization(state: frame.camera.trackingState)
         guard isRecording, !isCapturing else { return }
         guard pendingWriteCount < maxPendingWrites else { return }
         guard case .normal = frame.camera.trackingState else { return }
@@ -402,6 +410,23 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
                 self.isCapturing = false
             }
         }
+    }
+
+    private func recoverFromStuckRelocalization(state: ARCamera.TrackingState) {
+        guard case .limited(.relocalizing) = state else {
+            relocalizingSince = nil
+            return
+        }
+        if relocalizingSince == nil {
+            relocalizingSince = CACurrentMediaTime()
+        }
+        // Never reset mid-recording: a fresh world frame would corrupt the session's
+        // pose continuity. While recording, the capture gate stays closed instead.
+        guard !isRecording, let since = relocalizingSince,
+              CACurrentMediaTime() - since > relocalizationTimeout else { return }
+        relocalizingSince = nil
+        trackingWasReset = true
+        runSession(resetTracking: true)
     }
 
     private func captureShot(requestID: Int) {
