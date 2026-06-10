@@ -34,12 +34,14 @@ struct ContentView: View {
         .alert("Can't Create Zip", isPresented: shareErrorBinding) {
             Button("Open Files") {
                 shareErrorMessage = nil
+                manager.resumeAfterShare()
                 if let url = CaptureSessionManager.capturesFolderFilesURL() {
                     UIApplication.shared.open(url)
                 }
             }
             Button("OK", role: .cancel) {
                 shareErrorMessage = nil
+                manager.resumeAfterShare()
             }
         } message: {
             Text(shareErrorMessage ?? "")
@@ -48,6 +50,7 @@ struct ContentView: View {
             ShareSheet(items: [item.url]) {
                 try? FileManager.default.removeItem(at: item.url)
                 shareItem = nil
+                manager.resumeAfterShare()
             }
         }
     }
@@ -237,7 +240,7 @@ struct ContentView: View {
             return "Need texture"
         case "limited:relocalizing":
             return "Relocalizing"
-        case "interrupted":
+        case "interrupted", "paused":
             return "Camera paused"
         case "failed":
             return "Camera failed"

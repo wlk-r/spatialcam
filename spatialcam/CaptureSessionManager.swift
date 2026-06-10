@@ -46,7 +46,7 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     // once a delegate holds more than a handful. The completed session's files are
     // finished before completedSessionURL publishes, so reading them here is safe
     // while a new session records.
-    private let shareQueue = DispatchQueue(label: "spatialcam.share", qos: .userInitiated)
+    private let shareQueue = DispatchQueue(label: "spatialcam.share", qos: .utility)
     private let ciContext = CIContext(options: nil)
     // Backpressure for the capture gate: the 2 s watchdog can reopen the gate while
     // earlier shots are still writing, so bound how many ARFrames may be queued
@@ -184,6 +184,13 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
     func prepareShareArchive(completion: @escaping (Result<URL, Error>) -> Void) {
         guard let sessionURL = completedSessionURL, !isPreparingShare else { return }
         isPreparingShare = true
+        // Capture is locked out during the share flow, so the camera has no job —
+        // and a running session gets starved by the zip + share sheet (delegate
+        // frame retention climbs until ARKit stalls the camera). Pause here;
+        // resumeAfterShare() re-runs the SAME configuration when the flow ends.
+        session?.pause()
+        isSessionRunning = false
+        trackingStatus = "paused"
         // A multi-GB zip takes minutes with no touches; a screen lock would suspend
         // the app and stall it mid-archive.
         UIApplication.shared.isIdleTimerDisabled = true
@@ -233,6 +240,11 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
             }
             finish(result)
         }
+    }
+
+    func resumeAfterShare() {
+        guard !isSessionRunning, !isPreparingShare else { return }
+        runSession()
     }
 
     static func capturesFolderFilesURL() -> URL? {
@@ -824,8 +836,14 @@ final class CaptureSessionManager: NSObject, ObservableObject, ARSessionDelegate
 
     private func updateTrackingStatus(_ state: ARCamera.TrackingState) {
         let status = string(for: state)
-        DispatchQueue.main.async {
-            self.trackingStatus = status
+        // Publish only on change: setting an @Published 60x/s re-renders the whole
+        // SwiftUI tree continuously and keeps the main thread needlessly busy.
+        if Thread.isMainThread {
+            if trackingStatus != status { trackingStatus = status }
+        } else {
+            DispatchQueue.main.async {
+                if self.trackingStatus != status { self.trackingStatus = status }
+            }
         }
     }
 
