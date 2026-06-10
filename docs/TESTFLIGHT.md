@@ -23,12 +23,11 @@ What to test:
 2. Tap Start.
 3. Slowly scan a room or connected spaces. The screen stays awake while recording.
 4. Tap Stop and wait until the app reports all files written.
-5. Send the capture back: tap the share button next to Start.
-   - "Share Folder (AirDrop)" is instant — use it for AirDrop or Save to Files.
-   - "Zip and Share" prepares a .zip first (can take a few minutes on long
-     captures; keep the app open) — use it when emailing or uploading to a
-     cloud app that does not accept folders.
-   - Fallback (e.g. if the phone is low on space for a zip): open the Files
+5. Send the capture back: tap the share button next to Start. The app prepares
+   a .zip (can take a few minutes on long captures; keep the app open), then
+   AirDrop it or send via an iCloud/Drive link. Sessions can be several GB, so
+   AirDrop or a cloud link is usually best.
+   - Fallback (e.g. if the phone is low on space for the zip): open the Files
      app > On My iPhone > 3Dgs Capture > captures, long-press the session
      folder > Compress, and share the resulting .zip.
 
