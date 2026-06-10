@@ -46,7 +46,9 @@ struct ContentView: View {
         }
         .sheet(item: $shareItem) { item in
             ShareSheet(items: [item.url]) {
-                try? FileManager.default.removeItem(at: item.url)
+                if item.deleteOnComplete {
+                    try? FileManager.default.removeItem(at: item.url)
+                }
                 shareItem = nil
             }
         }
@@ -88,9 +90,21 @@ struct ContentView: View {
 
                 Spacer()
 
-                if manager.hasCompletedSession, manager.completedSessionURL != nil {
-                    Button {
-                        shareCompletedSession()
+                if manager.hasCompletedSession, let sessionURL = manager.completedSessionURL {
+                    Menu {
+                        Button {
+                            // Folders AirDrop/Save-to-Files natively — instant, no
+                            // disk cost. Zip exists for Mail/upload extensions that
+                            // reject directories.
+                            shareItem = ShareItem(url: sessionURL, deleteOnComplete: false)
+                        } label: {
+                            Label("Share Folder (AirDrop)", systemImage: "folder")
+                        }
+                        Button {
+                            shareCompletedSessionAsZip()
+                        } label: {
+                            Label("Zip and Share", systemImage: "doc.zipper")
+                        }
                     } label: {
                         Group {
                             if manager.isPreparingShare {
@@ -187,11 +201,11 @@ struct ContentView: View {
         )
     }
 
-    private func shareCompletedSession() {
+    private func shareCompletedSessionAsZip() {
         manager.prepareShareArchive { result in
             switch result {
             case .success(let url):
-                shareItem = ShareItem(url: url)
+                shareItem = ShareItem(url: url, deleteOnComplete: true)
             case .failure(let error):
                 shareErrorMessage = error.localizedDescription
             }
@@ -262,6 +276,7 @@ struct ContentView: View {
 
 struct ShareItem: Identifiable {
     let url: URL
+    let deleteOnComplete: Bool
     var id: String { url.path }
 }
 
