@@ -228,6 +228,7 @@ def align_and_optimize(
     keypoint_limit: int,
     tiepoint_limit: int,
     fixed_intrinsics: bool,
+    trust_poses: bool,
 ) -> None:
     chunk.matchPhotos(
         downscale=downscale,
@@ -241,8 +242,21 @@ def align_and_optimize(
     )
     doc.save()
 
-    chunk.alignCameras(adaptive_fitting=True, reset_alignment=True)
-    doc.save()
+    if trust_poses:
+        # Pure SfM (alignCameras + reset) discards the ARKit poses and relies on feature
+        # connectivity alone; on captures with fast-motion / corner gaps that fragments the
+        # reconstruction and drops every camera outside the largest component. Instead, place
+        # all cameras straight from the trusted ARKit reference poses, triangulate the matched
+        # tracks against those fixed poses to build the sparse cloud, then let optimizeCameras
+        # bundle-adjust intrinsics and make small pose corrections (the location/rotation
+        # reference accuracies keep gap frames anchored near their ARKit pose).
+        chunk.alignCamerasByReference()
+        doc.save()
+        chunk.triangulateTiePoints(min_image=2)
+        doc.save()
+    else:
+        chunk.alignCameras(adaptive_fitting=True, reset_alignment=True)
+        doc.save()
 
     chunk.optimizeCameras(
         fit_f=not fixed_intrinsics,
@@ -259,6 +273,11 @@ def align_and_optimize(
         adaptive_fitting=True,
     )
     doc.save()
+
+    if trust_poses:
+        # Re-triangulate against the BA-refined poses/intrinsics for a cleaner sparse seed.
+        chunk.triangulateTiePoints(min_image=2)
+        doc.save()
 
 
 def export_brush_dataset(chunk: Metashape.Chunk, out: Path) -> Path:
@@ -358,6 +377,7 @@ def run(args: argparse.Namespace) -> None:
             keypoint_limit=args.keypoint_limit,
             tiepoint_limit=args.tiepoint_limit,
             fixed_intrinsics=args.fixed_intrinsics,
+            trust_poses=args.trust_poses,
         )
 
     aligned = sum(1 for camera in chunk.cameras if camera.transform is not None)
@@ -388,8 +408,17 @@ def parse_args() -> argparse.Namespace:
                         help="Cluster photos into calibration groups by sidecar-v2 lens_position "
                              "(optional bin width, default 0.05) so groups can self-calibrate; "
                              "without this every photo gets its own fixed-by-trust sensor.")
+    parser.add_argument("--trust-poses", action="store_true",
+                        help="Place cameras from the ARKit reference poses (alignCamerasByReference) "
+                             "and triangulate the matched tracks against them instead of pure SfM, "
+                             "then bundle-adjust. Keeps every frame aligned on captures whose "
+                             "fast-motion/corner gaps fragment feature-only alignment. Requires "
+                             "orientation priors (the default).")
     parser.add_argument("--export-only", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.trust_poses and args.no_orientation_priors:
+        parser.error("--trust-poses needs the ARKit rotation priors; drop --no-orientation-priors.")
+    return args
 
 
 if __name__ == "__main__":

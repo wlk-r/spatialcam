@@ -82,8 +82,23 @@ python3 fuse_refined.py SESSION OUT [--stride 2] [--voxel 0.015] [--max-depth 8.
 | `--keypoint-limit` / `--tiepoint-limit` | 40000 / 10000 | raise tiepoints (e.g. 20000) for denser seed |
 | `--fixed-intrinsics` | off | freeze ARKit intrinsics (no self-calibration); only with per-frame sensors |
 | `--no-orientation-priors` | off | position-only priors |
+| `--trust-poses` | off | **use when alignment fragments** (see gotcha): place cameras from the ARKit poses instead of feature-only SfM, then BA. Needs orientation priors (the default) |
 
 Trains from `OUT/brush_dataset`.
+
+> **Gotcha — fragmented alignment, most cameras silently dropped.** The stock path is pure
+> SfM: `alignCameras(reset_alignment=True)` discards the ARKit poses and relies on feature
+> connectivity alone. Captures with fast-motion or sharp-corner gaps (low frame overlap) split
+> into disconnected components; Metashape keeps only the largest and **drops every other
+> camera without erroring** — one real session exported just 15/67. **Always check
+> `metashape_capture_summary.json` `aligned_cameras` after a run.** Predict it beforehand from
+> the trajectory: large inter-shot jumps (`p95 Δposition > ~0.4 m`, or any single jump
+> > ~0.6 m) mark the gaps, and the dropped shots cluster right at those jumps. Fix: re-run with
+> `--trust-poses`. It places all cameras straight from the trusted ARKit reference poses
+> (`alignCamerasByReference`), triangulates the matched tracks against them, then bundle-adjusts
+> intrinsics + small pose corrections (the location/rotation accuracy priors keep gap frames
+> anchored). That recovered 65/67 on the same session while staying Metashape-refined. The
+> handful still dropped are isolated low-overlap frames and don't dent coverage.
 
 ## 3. Train (Brush)
 
@@ -108,6 +123,29 @@ Quality preset for real (non-smoke) runs:
 STEPS=30000 REFINE_EVERY=200 GROWTH_STOP=15000 MAX_SPLATS=10000000 \
   MAX_RESOLUTION=1920 ./run_brush_smoketest.sh DATASET OUT_DIR
 ```
+
+**Resolution is the quality lever, not memory.** Brush used ~1.4 GB at `MAX_RESOLUTION=1920`
+and ~3 GB at native 4032 — a rounding error on a 120 GB machine — and a single room never
+approaches the `MAX_SPLATS` cap (it tops out ~2.9 M splats vs the 10 M cap). So there is **no
+"give it more RAM for better output" knob**; output is bounded by supervision resolution, the
+splat count the views can actually constrain, and steps. The dial worth spending hardware on is
+`MAX_RESOLUTION`: raise it toward the source resolution (these JPEGs are 4032×3024) for sharper
+texture and edges. The cost is compute/time, not memory — measured on an M5 Max:
+
+| `MAX_RESOLUTION` | steady-state steps/s | RSS | ~30k wall-clock |
+|---|---|---|---|
+| 1920 | ~18.5 | 1.4 GB | ~25 min |
+| 4032 (native) | ~5.0 | 3.1 GB | ~90 min |
+
+Steps/s is **not constant** — it falls as densification grows the splat count, then stabilizes
+after `GROWTH_STOP`. Stopping at `GROWTH_STOP` (15k here) is a defensible early exit: the splats
+are fully grown, you only forgo the post-growth color/opacity/position polish.
+
+**Live viewer.** The script runs headless (zero viewer cost — keep it that way for
+batch/SSH/unattended runs). For a live preview, invoke `brush_app` directly and add
+`--with-viewer` (the script doesn't expose it); it opens a window you can orbit while training.
+Overhead is modest — the preview renders share the GPU, and an occluded/minimized window
+throttles toward nothing. There is no "flag on but no window" state; it always spawns a window.
 
 Flags the script doesn't expose (pass by editing the script or invoking `brush_app` directly):
 
